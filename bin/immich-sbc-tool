@@ -182,7 +182,18 @@ detect_installation_state() {
     fi
 
     # 3. Check DietPi Native Installation (dietpi-software 215)
-    if [ -f "/etc/systemd/system/immich.service" ] || [ -d "$DIETPI_IMMICH_DATA" ]; then
+    # Harus ada binary/script dietpi-software atau /boot/dietpi/dietpi-software
+    local has_dietpi_cmd=false
+    if command -v dietpi-software >/dev/null 2>&1 || [ -f "/boot/dietpi/dietpi-software" ] || [ -f "/DietPi/dietpi/dietpi-software" ]; then
+        has_dietpi_cmd=true
+    fi
+
+    if [ -f "/etc/systemd/system/immich.service" ]; then
+        IS_INSTALLED=true
+        STACK_TYPE="dietpi"
+        TARGET_DIR="$DIETPI_IMMICH_DATA"
+        return 0
+    elif [ "$has_dietpi_cmd" = true ] && [ -d "$DIETPI_IMMICH_DATA" ]; then
         IS_INSTALLED=true
         STACK_TYPE="dietpi"
         TARGET_DIR="$DIETPI_IMMICH_DATA"
@@ -451,10 +462,32 @@ do_update_immich() {
 
     elif [ "$STACK_TYPE" == "dietpi" ]; then
         log "🍓 Mengupdate Immich melalui DietPi Software Suite..."
-        # Reinstall 215 without wiping user data / database
-        dietpi-software reinstall 215
-        systemctl restart immich || true
-        log "${GREEN}✅ Update DietPi Native Immich Selesai!${NC}"
+        
+        # Resolusi perintah dietpi-software di berbagai path
+        local dietpi_bin=""
+        if command -v dietpi-software >/dev/null 2>&1; then
+            dietpi_bin="dietpi-software"
+        elif [ -x "/boot/dietpi/dietpi-software" ]; then
+            dietpi_bin="/boot/dietpi/dietpi-software"
+        elif [ -x "/DietPi/dietpi/dietpi-software" ]; then
+            dietpi_bin="/DietPi/dietpi/dietpi-software"
+        fi
+
+        if [ -n "$dietpi_bin" ]; then
+            # Reinstall 215 without wiping user data / database
+            $dietpi_bin reinstall 215
+            systemctl restart immich || true
+            log "${GREEN}✅ Update DietPi Native Immich Selesai!${NC}"
+        else
+            log "${YELLOW}⚠️ Perintah dietpi-software tidak ditemukan di path sistem.${NC}"
+            log "   Beralih memperbarui service & dependensi Immich secara manual..."
+            if systemctl is-active --quiet immich; then
+                systemctl restart immich
+                log "${GREEN}✅ Service immich berhasil direstart.${NC}"
+            else
+                log "${RED}❌ Gagal mengeksekusi update DietPi: script dietpi-software tidak ditemukan.${NC}"
+            fi
+        fi
     fi
 }
 
