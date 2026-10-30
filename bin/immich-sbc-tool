@@ -461,31 +461,59 @@ do_update_immich() {
         fi
 
     elif [ "$STACK_TYPE" == "dietpi" ]; then
-        log "🍓 Mengupdate Immich melalui DietPi Software Suite..."
+        log "🍓 Mengupdate Immich Native (No-Docker) tanpa kompilasi lokal..."
         
-        # Resolusi perintah dietpi-software di berbagai path
-        local dietpi_bin=""
-        if command -v dietpi-software >/dev/null 2>&1; then
-            dietpi_bin="dietpi-software"
-        elif [ -x "/boot/dietpi/dietpi-software" ]; then
-            dietpi_bin="/boot/dietpi/dietpi-software"
-        elif [ -x "/DietPi/dietpi/dietpi-software" ]; then
-            dietpi_bin="/DietPi/dietpi/dietpi-software"
+        # 1. Pastikan dependensi sistem native terpasang (Postgres, Redis, Node, FFmpeg)
+        ensure_codecs_and_tools
+        
+        # 2. Hentikan service immich sebelum mengganti binary
+        if systemctl is-active --quiet immich; then
+            log "   Menghentikan service immich sementara..."
+            systemctl stop immich || true
         fi
 
-        if [ -n "$dietpi_bin" ]; then
-            # Reinstall 215 without wiping user data / database
-            $dietpi_bin reinstall 215
-            systemctl restart immich || true
-            log "${GREEN}✅ Update DietPi Native Immich Selesai!${NC}"
+        # 3. Download bundle pre-built dari GitHub Release (bebas kompilasi lokal)
+        local target_version="v3.3.5"
+        local bundle_url="https://github.com/faisalfa123/immich-odroid-c2/releases/download/${target_version}/immich-prebuilt-${target_version}-native.tar.gz"
+        local temp_tar="/tmp/immich-prebuilt-${target_version}-native.tar.gz"
+
+        log "   Mengunduh bundle pre-compiled Immich $target_version dari GitHub..."
+        if curl -f -L -sS "$bundle_url" -o "$temp_tar"; then
+            log "   ✅ Bundle pre-compiled berhasil diunduh. Mengekstrak langsung ke /opt/immich..."
+            mkdir -p /opt
+            tar -xzf "$temp_tar" -C /
+            rm -f "$temp_tar"
+            
+            # Sesuaikan kepemilikan user immich jika ada
+            if id "immich" >/dev/null 2>&1; then
+                chown -R immich:immich /opt/immich 2>/dev/null || true
+            fi
+            
+            # Nyalakan kembali service immich
+            log "   Menjalankan ulang service immich..."
+            systemctl daemon-reload
+            systemctl restart immich
+            
+            log "${GREEN}🎉 Update Immich Native Selesai!${NC}"
+            log "   Data foto & database PostgreSQL Anda tetap utuh."
+            log "   Status service: $(systemctl is-active immich)"
         else
-            log "${YELLOW}⚠️ Perintah dietpi-software tidak ditemukan di path sistem.${NC}"
-            log "   Beralih memperbarui service & dependensi Immich secara manual..."
-            if systemctl is-active --quiet immich; then
-                systemctl restart immich
-                log "${GREEN}✅ Service immich berhasil direstart.${NC}"
+            log "${YELLOW}⚠️ Bundle pre-built GitHub belum tersedia. Mencoba fallback ke dietpi-software...${NC}"
+            local dietpi_bin=""
+            if command -v dietpi-software >/dev/null 2>&1; then
+                dietpi_bin="dietpi-software"
+            elif [ -x "/boot/dietpi/dietpi-software" ]; then
+                dietpi_bin="/boot/dietpi/dietpi-software"
+            elif [ -x "/DietPi/dietpi/dietpi-software" ]; then
+                dietpi_bin="/DietPi/dietpi/dietpi-software"
+            fi
+
+            if [ -n "$dietpi_bin" ]; then
+                $dietpi_bin reinstall 215
+                systemctl restart immich || true
+                log "${GREEN}✅ Update DietPi Native Selesai!${NC}"
             else
-                log "${RED}❌ Gagal mengeksekusi update DietPi: script dietpi-software tidak ditemukan.${NC}"
+                log "${RED}❌ Gagal mengunduh bundle rilis dan dietpi-software tidak ditemukan.${NC}"
             fi
         fi
     fi

@@ -1,0 +1,116 @@
+name: Build and Release Immich Native ARM64 (No-Docker)
+
+on:
+  workflow_dispatch:
+    inputs:
+      immich_version:
+        description: 'Immich Tag to Build'
+        required: true
+        default: 'v3.3.5'
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-arm64-native:
+    name: Build Immich Pre-compiled ARM64 Bundle
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: latest
+          run_install: false
+
+      - name: Install Wasm & Build Tools (extism-js & binaryen)
+        run: |
+          set -e
+          echo "Installing extism-js and binaryen for Linux x86_64 host build..."
+          EXTISM_URL=$(curl -sSfL "https://api.github.com/repos/extism/js-pdk/releases/latest" | grep -Po '"browser_download_url": *"\K[^"]*\/extism-js-x86_64-linux-[^"\/]*\.gz(?=")')
+          curl -sSfL "$EXTISM_URL" | gunzip > /usr/local/bin/extism-js
+          chmod +x /usr/local/bin/extism-js
+
+          BINARYEN_URL=$(curl -sSfL "https://api.github.com/repos/WebAssembly/binaryen/releases/latest" | grep -Po '"browser_download_url": *"\K[^"]*\/binaryen-[^"\/]*-x86_64-linux\.tar\.gz(?=")')
+          curl -sSfL "$BINARYEN_URL" | tar -xz
+          mv binaryen-*/bin/wasm-merge binaryen-*/bin/wasm-opt /usr/local/bin/
+          rm -rf binaryen-*
+
+      - name: Download Immich Source
+        run: |
+          set -e
+          VERSION="${{ github.event.inputs.immich_version || 'v3.3.5' }}"
+          echo "BUILD_VERSION=$VERSION" >> $GITHUB_ENV
+          echo "Downloading Immich source for tag: $VERSION"
+          curl -sSfL "https://github.com/immich-app/immich/archive/${VERSION}.tar.gz" | tar -xz
+          mv "immich-${VERSION#v}" immich-src
+
+      - name: Install Dependencies & Build Web, SDK, Plugins
+        run: |
+          set -e
+          cd immich-src
+          export NODE_OPTIONS='--max-old-space-size=6144'
+          echo "Installing pnpm dependencies..."
+          pnpm --filter immich --filter @immich/sdk --filter immich-web --filter @immich/plugin-sdk --filter @immich/plugin-core i
+          
+          echo "Building Immich Server, Web UI & Plugins..."
+          pnpm --filter immich --filter @immich/sdk --filter immich-web --filter @immich/plugin-sdk --filter @immich/plugin-core build
+
+      - name: Assemble /opt/immich Package
+        run: |
+          set -e
+          mkdir -p package/opt/immich
+          cd immich-src
+
+          # Deploy production dependencies for immich server targeting ARM64/Linux
+          pnpm --filter immich -P deploy ../package/opt/immich
+
+          # Move Web Frontend (built Vite client)
+          mv web/build ../package/opt/immich/www
+
+          # Move Plugins
+          mkdir -p ../package/opt/immich/plugins/immich-plugin-core
+          mv packages/plugin-core/dist ../package/opt/immich/plugins/immich-plugin-core/
+          mv packages/plugin-core/manifest.json ../package/opt/immich/plugins/immich-plugin-core/
+
+          # Download GeoData so Odroid-C2 doesn't have to download it during runtime
+          mkdir -p ../package/opt/immich/geodata
+          curl -sSfLo ../package/opt/immich/geodata/ne_10m_admin_0_countries.geojson \
+            'https://raw.githubusercontent.com/nvkelso/natural-earth-vector/v5.1.2/geojson/ne_10m_admin_0_countries.geojson'
+          date --iso-8601=seconds | tr -d '\n' > ../package/opt/immich/geodata/geodata-date.txt
+
+      - name: Package Tarball
+        run: |
+          set -e
+          cd package
+          tar -czvf "../immich-prebuilt-${{ env.BUILD_VERSION }}-native.tar.gz" opt/
+          cd ..
+          ls -lh immich-prebuilt-*.tar.gz
+
+      - name: Create GitHub Release and Upload Asset
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        with:
+          tag_name: ${{ env.BUILD_VERSION }}
+          name: Immich Pre-compiled Native ${{ env.BUILD_VERSION }}
+          draft: false
+          prerelease: false
+          files: immich-prebuilt-${{ env.BUILD_VERSION }}-native.tar.gz
+          body: |
+            ## 🚀 Immich Pre-compiled Native ARM64/Linux Package
+            Bundle binary & web distribution siap pakai untuk **DietPi / Debian ARM64 / Low-End SBC (ODROID-C2)**.
+            
+            ### Keunggulan:
+            - **100% Native (Tanpa Docker)**
+            - **Zero Compiling**: Tidak perlu build Node/Vite/TypeScript di SBC.
+            - Menghindari hang/freeze pada CPU Cortex-A53 dan RAM 2GB.
+            - Ekstrak langsung ke `/opt/immich` dan langsung running via systemd.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
