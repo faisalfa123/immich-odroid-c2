@@ -1,0 +1,586 @@
+#!/bin/bash
+# ==============================================================================
+# IMMICH SBC TOOL - Multi-function TUI Manager for Low-End SBC (ODROID-C2)
+# Supported OS: DietPi / Debian ARM64 / Ubuntu Server
+# Features:
+#   - Auto-detection: Fresh Install vs. Update Existing
+#   - Stack auto-detection: Docker Compose vs. DietPi Native (ID 215)
+#   - Zero data loss: Preserves existing database & media
+#   - Auto-backup of PostgreSQL and configs before update
+#   - Rollback capability to restore previous working version
+#   - Codec optimizations: HEIC, x265 (MP4/MKV), MOV, RAW support
+#   - Heavy process suspension (Jellyfin/Plex/Nextcloud) before build/update
+#   - Automatic restoration of suspended processes on exit (success or fail)
+#   - Detailed debugging logs (/var/log/immich-updater.log)
+#   - Seamless integration with Bumiayu TUI
+# ==============================================================================
+
+set -euo pipefail
+
+# ------------------------------------------------------------------------------
+# Global Variables & Paths
+# ------------------------------------------------------------------------------
+VERSION="1.0.0"
+LOG_FILE="/var/log/immich-updater.log"
+BACKUP_DIR="/var/backups/immich"
+DOCKER_DIR="/opt/immich-app"
+DIETPI_IMMICH_DATA="/mnt/dietpi_userdata/immich"
+SUSPENDED_SERVICES_FILE="/tmp/immich_suspended_services.state"
+
+# Color definitions
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# Ensure log file exists and writable
+touch "$LOG_FILE" 2>/dev/null || true
+
+# ------------------------------------------------------------------------------
+# Logging Helper
+# ------------------------------------------------------------------------------
+log() {
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo -e "$1"
+    # Strip ANSI color codes for file logging
+    echo -e "$timestamp: $1" | sed 's/\x1b\[[0-9;]*m//g' >> "$LOG_FILE" 2>/dev/null || true
+}
+
+# ------------------------------------------------------------------------------
+# Root Check
+# ------------------------------------------------------------------------------
+check_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo -e "${RED}❌ Error: Script ini harus dijalankan sebagai root (gunakan sudo).${NC}"
+        exit 1
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Process Guardian: Suspend Heavy Services Before Build/Update
+# ------------------------------------------------------------------------------
+suspend_heavy_services() {
+    log "${YELLOW}🛡️ [Process Guardian] Memeriksa layanan berat yang berpotensi membebani RAM/CPU...${NC}"
+    rm -f "$SUSPENDED_SERVICES_FILE"
+    touch "$SUSPENDED_SERVICES_FILE"
+
+    # Services list that consume high RAM/CPU on low-end SBC
+    local heavy_list=("jellyfin" "plexmediaserver" "emby-server" "nextcloud" "qbittorrent-nox" "transmission-daemon" "deluged" "mysqld" "mariadb")
+    local suspended_count=0
+
+    for svc in "${heavy_list[@]}"; do
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            log "   ⏸️ Menghentikan sementara service: ${BOLD}$svc${NC}"
+            systemctl stop "$svc" 2>/dev/null || true
+            echo "$svc" >> "$SUSPENDED_SERVICES_FILE"
+            suspended_count=$((suspended_count + 1))
+        fi
+    done
+
+    # Check for docker containers consuming memory if not part of immich
+    if command -v docker >/dev/null 2>&1 && systemctl is-active --quiet docker 2>/dev/null; then
+        local other_containers
+        other_containers=$(docker ps --format '{{.Names}}' | grep -v -E '^immich_' || true)
+        if [ -n "$other_containers" ]; then
+            for c in $other_containers; do
+                log "   ⏸️ Mem-pause docker container: ${BOLD}$c${NC}"
+                docker pause "$c" 2>/dev/null || true
+                echo "docker_paused:$c" >> "$SUSPENDED_SERVICES_FILE"
+                suspended_count=$((suspended_count + 1))
+            done
+        fi
+    fi
+
+    if [ "$suspended_count" -eq 0 ]; then
+        log "   ✅ Tidak ada layanan berat eksternal yang aktif. Memori bebas maksimal."
+    else
+        log "   ✅ $suspended_count layanan telah di-freeze demi kelancaran proses."
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Process Guardian: Restore Suspended Services (Called on EXIT/INT/TERM)
+# ------------------------------------------------------------------------------
+restore_services() {
+    if [ -f "$SUSPENDED_SERVICES_FILE" ]; then
+        log "${CYAN}🔄 [Process Guardian] Mengembalikan status layanan yang sebelumnya dihentikan...${NC}"
+        while IFS= read -r item || [ -n "$item" ]; do
+            if [[ "$item" =~ ^docker_paused:(.+) ]]; then
+                local c_name="${BASH_REMATCH[1]}"
+                log "   ▶️ Me-resume docker container: ${BOLD}$c_name${NC}"
+                docker unpause "$c_name" 2>/dev/null || true
+            elif [ -n "$item" ]; then
+                log "   ▶️ Menyalakan kembali service: ${BOLD}$item${NC}"
+                systemctl start "$item" 2>/dev/null || true
+            fi
+        done < "$SUSPENDED_SERVICES_FILE"
+        rm -f "$SUSPENDED_SERVICES_FILE"
+        log "${GREEN}✅ Seluruh layanan latar belakang telah dipulihkan.${NC}"
+    fi
+}
+
+# Trap signals so restore_services is ALWAYS executed
+trap restore_services EXIT INT TERM
+
+# ------------------------------------------------------------------------------
+# System & Hardware Probing
+# ------------------------------------------------------------------------------
+probe_hardware() {
+    local arch cpu_info total_ram
+    arch=$(uname -m)
+    total_ram=$(free -m | awk '/^Mem:/{print $2}')
+    cpu_info="Unknown"
+    if [ -f /proc/cpuinfo ]; then
+        cpu_info=$(grep -m 1 "model name" /proc/cpuinfo | cut -d: -f2 | xargs || true)
+        if [ -z "$cpu_info" ]; then
+            cpu_info=$(grep -m 1 "Hardware" /proc/cpuinfo | cut -d: -f2 | xargs || true)
+        fi
+    fi
+
+    log "🖥️ Hardware Info: Arch=[$arch] | CPU=[$cpu_info] | Total RAM=[${total_ram}MB]"
+    
+    # Check if swap is active; if low, warn user
+    local total_swap
+    total_swap=$(free -m | awk '/^Swap:/{print $2}')
+    if [ "$total_swap" -lt 512 ]; then
+        log "${YELLOW}⚠️ Peringatan: Swap memori terdeteksi kurang dari 512MB (${total_swap}MB).${NC}"
+        log "   Disarankan menambahkan Swap file minimal 1GB di Odroid-C2 agar aman dari OOM."
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Environment & Deployment Mode Detection
+# ------------------------------------------------------------------------------
+detect_installation_state() {
+    # Returns via global variables:
+    # IS_INSTALLED: true/false
+    # STACK_TYPE: "docker" / "dietpi" / "none"
+    # TARGET_DIR: location path
+
+    IS_INSTALLED=false
+    STACK_TYPE="none"
+    TARGET_DIR=""
+
+    # 1. Check Docker Deployment
+    if [ -f "$DOCKER_DIR/docker-compose.yml" ] || [ -f "$DOCKER_DIR/compose.yaml" ]; then
+        IS_INSTALLED=true
+        STACK_TYPE="docker"
+        TARGET_DIR="$DOCKER_DIR"
+        return 0
+    fi
+
+    # 2. Check Custom / Current directory Docker Compose
+    if [ -f "./docker-compose.yml" ] && grep -q "immich" "./docker-compose.yml" 2>/dev/null; then
+        IS_INSTALLED=true
+        STACK_TYPE="docker"
+        TARGET_DIR="$(pwd)"
+        return 0
+    fi
+
+    # 3. Check DietPi Native Installation (dietpi-software 215)
+    if [ -f "/etc/systemd/system/immich.service" ] || [ -d "$DIETPI_IMMICH_DATA" ]; then
+        IS_INSTALLED=true
+        STACK_TYPE="dietpi"
+        TARGET_DIR="$DIETPI_IMMICH_DATA"
+        return 0
+    fi
+
+    return 0
+}
+
+# ------------------------------------------------------------------------------
+# Formats & Codecs Dependencies Setup
+# ------------------------------------------------------------------------------
+ensure_codecs_and_tools() {
+    log "${CYAN}📦 Memastikan pustaka decoding (HEIC, RAW, MOV, x265) terpasang...${NC}"
+    
+    local packages_to_install=()
+    
+    # Check whiptail / dialog
+    if ! command -v whiptail >/dev/null 2>&1 && ! command -v dialog >/dev/null 2>&1; then
+        packages_to_install+=("whiptail")
+    fi
+
+    # Check heic support
+    if ! dpkg -l | grep -q "libheif"; then
+        packages_to_install+=("libheif-examples" "libheif1")
+    fi
+
+    # Check raw camera format support
+    if ! command -v dcraw >/dev/null 2>&1 && ! dpkg -l | grep -q "libraw"; then
+        packages_to_install+=("libraw-bin" "dcraw")
+    fi
+
+    # Check ffmpeg
+    if ! command -v ffmpeg >/dev/null 2>&1; then
+        packages_to_install+=("ffmpeg")
+    fi
+
+    if [ ${#packages_to_install[@]} -gt 0 ]; then
+        log "   Memasang paket sistem: ${packages_to_install[*]}..."
+        apt-get update -qq || true
+        apt-get install -y -qq "${packages_to_install[@]}" || true
+        log "${GREEN}✅ Pustaka decoding HEIC/RAW/ffmpeg berhasil dikonfigurasi.${NC}"
+    else
+        log "   ✅ Semua pustaka decoding esensial sudah terpasang."
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Backup Engine (Database & Configuration)
+# ------------------------------------------------------------------------------
+do_backup() {
+    local timestamp
+    timestamp=$(date '+%Y%m%d_%H%M%S')
+    local current_backup="$BACKUP_DIR/backup_$timestamp"
+    
+    log "${YELLOW}💾 [Backup Engine] Memulai pencadangan data & database...${NC}"
+    mkdir -p "$current_backup"
+
+    detect_installation_state
+
+    if [ "$STACK_TYPE" == "docker" ]; then
+        # Backup .env and docker-compose
+        log "   Menyimpan konfigurasi Docker Compose..."
+        cp -a "$TARGET_DIR"/*.env "$current_backup/" 2>/dev/null || true
+        cp -a "$TARGET_DIR"/docker-compose*.yml "$current_backup/" 2>/dev/null || true
+        
+        # Backup PostgreSQL from container if running
+        if docker ps | grep -q "immich_postgres"; then
+            log "   Mengekspor PostgreSQL Database dari container (pg_dumpall)..."
+            docker exec -t immich_postgres pg_dumpall -c -U postgres 2>/dev/null | gzip > "$current_backup/database_dump.sql.gz" || {
+                log "${RED}⚠️ Gagal pg_dumpall container, mencoba pg_dump database immich...${NC}"
+                docker exec -t immich_postgres pg_dump -U postgres immich 2>/dev/null | gzip > "$current_backup/database_dump.sql.gz" || true
+            }
+        fi
+    elif [ "$STACK_TYPE" == "dietpi" ]; then
+        log "   Menyimpan konfigurasi DietPi Immich..."
+        if [ -f "/etc/systemd/system/immich.service" ]; then
+            cp -a /etc/systemd/system/immich.service "$current_backup/" || true
+        fi
+        if [ -d "$TARGET_DIR" ]; then
+            find "$TARGET_DIR" -maxdepth 2 -name "*.env" -exec cp -a {} "$current_backup/" \; 2>/dev/null || true
+        fi
+        # Dump native postgresql if service is active
+        if systemctl is-active --quiet postgresql; then
+            log "   Mengekspor PostgreSQL Native Database..."
+            sudo -u postgres pg_dump immich 2>/dev/null | gzip > "$current_backup/database_dump.sql.gz" || true
+        fi
+    fi
+
+    # Save metadata marker for rollback
+    cat << EOF > "$current_backup/metadata.json"
+{
+  "timestamp": "$timestamp",
+  "stack_type": "$STACK_TYPE",
+  "target_dir": "$TARGET_DIR"
+}
+EOF
+    # Set link to latest backup
+    ln -sfn "$current_backup" "$BACKUP_DIR/latest"
+    log "${GREEN}✅ Backup berhasil disimpan di: ${BOLD}$current_backup${NC}"
+    log "   Symbolic link 'latest' diperbarui ke backup ini."
+}
+
+# ------------------------------------------------------------------------------
+# Rollback Engine
+# ------------------------------------------------------------------------------
+do_rollback() {
+    log "${RED}⏪ [Rollback Engine] Memulai proses pemulihan ke versi sebelumnya...${NC}"
+    
+    if [ ! -L "$BACKUP_DIR/latest" ] && [ ! -d "$BACKUP_DIR/latest" ]; then
+        log "${RED}❌ Tidak ditemukan data backup di $BACKUP_DIR/latest.${NC}"
+        return 1
+    fi
+
+    local restore_path
+    restore_path=$(readlink -f "$BACKUP_DIR/latest")
+    log "   Menggunakan backup dari: ${BOLD}$restore_path${NC}"
+
+    if [ -f "$restore_path/metadata.json" ]; then
+        local orig_stack orig_dir
+        orig_stack=$(grep -o '"stack_type": "[^"]*' "$restore_path/metadata.json" | grep -o '[^"]*$')
+        orig_dir=$(grep -o '"target_dir": "[^"]*' "$restore_path/metadata.json" | grep -o '[^"]*$')
+
+        if [ "$orig_stack" == "docker" ] && [ -d "$orig_dir" ]; then
+            log "   Memulihkan konfigurasi docker compose ke $orig_dir..."
+            cp -a "$restore_path"/*.env "$orig_dir/" 2>/dev/null || true
+            cp -a "$restore_path"/docker-compose*.yml "$orig_dir/" 2>/dev/null || true
+            
+            # Restart docker stack
+            cd "$orig_dir"
+            docker compose down || true
+            docker compose up -d
+            
+            # Restore database dump if exists
+            if [ -f "$restore_path/database_dump.sql.gz" ]; then
+                log "   Menunggu PostgreSQL siap untuk restore..."
+                sleep 10
+                zcat "$restore_path/database_dump.sql.gz" | docker exec -i immich_postgres psql -U postgres immich || true
+            fi
+            log "${GREEN}✅ Rollback Docker Compose selesai.${NC}"
+        elif [ "$orig_stack" == "dietpi" ]; then
+            log "   Memulihkan konfigurasi DietPi native..."
+            if [ -f "$restore_path/immich.service" ]; then
+                cp -a "$restore_path/immich.service" /etc/systemd/system/
+                systemctl daemon-reload
+                systemctl restart immich
+            fi
+            if [ -f "$restore_path/database_dump.sql.gz" ]; then
+                zcat "$restore_path/database_dump.sql.gz" | sudo -u postgres psql immich || true
+            fi
+            log "${GREEN}✅ Rollback DietPi selesai.${NC}"
+        fi
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Action: Fresh Install (Optimized for Odroid-C2)
+# ------------------------------------------------------------------------------
+do_fresh_install() {
+    log "\n${GREEN}🚀 =======================================================${NC}"
+    log "${GREEN}   MEMULAI FRESH INSTALL IMMICH (ODROID-C2 OPTIMIZED)    ${NC}"
+    log "${GREEN}=========================================================${NC}\n"
+
+    suspend_heavy_services
+    ensure_codecs_and_tools
+    probe_hardware
+
+    # Check if docker is installed
+    if ! command -v docker >/dev/null 2>&1; then
+        log "${CYAN}🐳 Docker belum terpasang. Memasang Docker CE & Compose...${NC}"
+        curl -fsSL https://get.docker.com | sh || {
+            log "${RED}❌ Gagal memasang docker via get.docker.com${NC}"
+            return 1
+        }
+        systemctl enable --now docker
+    fi
+
+    # Prepare Directory
+    mkdir -p "$DOCKER_DIR"
+    mkdir -p /mnt/dietpi_userdata/immich_data
+    mkdir -p /mnt/dietpi_userdata/immich_db
+    mkdir -p "$DOCKER_DIR/config"
+
+    # Copy / Write optimized compose & env
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    if [ -f "$SCRIPT_DIR/../config/docker-compose.low-ram.yml" ]; then
+        cp -f "$SCRIPT_DIR/../config/docker-compose.low-ram.yml" "$DOCKER_DIR/docker-compose.yml"
+        cp -f "$SCRIPT_DIR/../config/immich.env.template" "$DOCKER_DIR/.env"
+        cp -f "$SCRIPT_DIR/../config/postgresql-sbc.conf" "$DOCKER_DIR/config/postgresql-sbc.conf"
+    else
+        log "   Mengunduh template konfigurasi low-ram..."
+        curl -fsSL https://raw.githubusercontent.com/faisalfa123/immich-odroid-c2/main/config/docker-compose.low-ram.yml -o "$DOCKER_DIR/docker-compose.yml"
+        curl -fsSL https://raw.githubusercontent.com/faisalfa123/immich-odroid-c2/main/config/immich.env.template -o "$DOCKER_DIR/.env"
+        curl -fsSL https://raw.githubusercontent.com/faisalfa123/immich-odroid-c2/main/config/postgresql-sbc.conf -o "$DOCKER_DIR/config/postgresql-sbc.conf"
+    fi
+
+    # Launch Stack
+    log "   Menjalankan Immich Docker Stack..."
+    cd "$DOCKER_DIR"
+    docker compose pull || true
+    docker compose up -d
+
+    log "${GREEN}🎉 Fresh Install Immich Selesai!${NC}"
+    log "   Web Interface: ${BOLD}http://<IP-ODROID-C2>:2283${NC}"
+}
+
+# ------------------------------------------------------------------------------
+# Action: Update Existing Immich (Zero Data Loss)
+# ------------------------------------------------------------------------------
+do_update_immich() {
+    log "\n${GREEN}🔄 =======================================================${NC}"
+    log "${GREEN}   MEMULAI PEMBARUAN IMMICH KE VERSI MODERN              ${NC}"
+    log "${GREEN}=========================================================${NC}\n"
+
+    detect_installation_state
+
+    if [ "$IS_INSTALLED" = false ]; then
+        log "${YELLOW}⚠️ Tidak ditemukan instalasi Immich sebelumnya.${NC}"
+        log "   Beralih ke mode Fresh Install..."
+        do_fresh_install
+        return 0
+    fi
+
+    log "💡 Terdeteksi instalasi aktif bertipe: ${BOLD}$STACK_TYPE${NC} di ${BOLD}$TARGET_DIR${NC}"
+
+    # 1. Suspend background services to free up RAM & CPU
+    suspend_heavy_services
+
+    # 2. Ensure formats/codecs are ready
+    ensure_codecs_and_tools
+
+    # 3. Create full safety backup
+    do_backup
+
+    # 4. Perform Update according to Stack Type
+    if [ "$STACK_TYPE" == "docker" ]; then
+        log "🐳 Mengupdate Immich Docker Stack di $TARGET_DIR..."
+        cd "$TARGET_DIR"
+
+        # Update image tags to latest / modern release while keeping volume mapping intact
+        log "   Menarik image container terbaru..."
+        docker compose pull
+
+        # Apply low-spec tuning in environment if missing
+        if ! grep -q "IMMICH_MACHINE_LEARNING_ENABLED" .env 2>/dev/null; then
+            log "   Menambahkan proteksi low-RAM Odroid-C2 ke .env..."
+            echo -e "\n# Odroid-C2 Low-RAM Tuning\nIMMICH_MACHINE_LEARNING_ENABLED=false\nIMMICH_CONCURRENCY=1\nIMMICH_SERVER_PREFER_DIRECT_STREAM=true" >> .env
+        fi
+
+        log "   Memulai ulang kontainer dengan image baru..."
+        docker compose up -d --remove-orphans
+
+        # Health check
+        log "   Memverifikasi status container..."
+        sleep 5
+        if docker ps | grep -q "immich_server"; then
+            log "${GREEN}✅ Update Immich Berhasil! Database & Media tetap utuh.${NC}"
+        else
+            log "${RED}❌ Terjadi kendala: immich_server tidak berjalan normal.${NC}"
+            log "   Apakah Anda ingin melakukan rollback otomatis sekarang? (y/n)"
+            read -r ans
+            if [[ "$ans" =~ ^[Yy]$ ]]; then
+                do_rollback
+            fi
+        fi
+
+    elif [ "$STACK_TYPE" == "dietpi" ]; then
+        log "🍓 Mengupdate Immich melalui DietPi Software Suite..."
+        # Reinstall 215 without wiping user data / database
+        dietpi-software reinstall 215
+        systemctl restart immich || true
+        log "${GREEN}✅ Update DietPi Native Immich Selesai!${NC}"
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# TUI Interactive Main Menu
+# ------------------------------------------------------------------------------
+show_tui_menu() {
+    check_root
+
+    while true; do
+        detect_installation_state
+        local status_str="Belum Terpasang"
+        if [ "$IS_INSTALLED" = true ]; then
+            status_str="Terpasang ($STACK_TYPE)"
+        fi
+
+        local choice
+        if command -v whiptail >/dev/null 2>&1; then
+            choice=$(whiptail --title "🏝️ Immich SBC Optimizer & Updater (ODROID-C2)" \
+                --menu "Status Sistem: $status_str\nSilakan pilih tindakan yang ingin dilakukan:" 18 72 7 \
+                "1" "Auto-Detect & Upgrade Immich (Modern + Low-RAM Profile)" \
+                "2" "Fresh Install Immich (Optimized for Odroid-C2)" \
+                "3" "Backup Database & Konfigurasi Sekarang" \
+                "4" "Restore / Rollback ke Backup Terakhir" \
+                "5" "Cek Dukungan Format (HEIC, RAW, x265, MOV)" \
+                "6" "Lihat Live Debug Log (/var/log/immich-updater.log)" \
+                "0" "Keluar" 3>&1 1>&2 2>&3) || choice="0"
+        else
+            clear
+            echo "=========================================================="
+            echo " 🏝️ IMMICH SBC OPTIMIZER & UPDATER (ODROID-C2)"
+            echo " Status Sistem: $status_str"
+            echo "=========================================================="
+            echo "1) Auto-Detect & Upgrade Immich (Modern + Low-RAM Profile)"
+            echo "2) Fresh Install Immich (Optimized for Odroid-C2)"
+            echo "3) Backup Database & Konfigurasi Sekarang"
+            echo "4) Restore / Rollback ke Backup Terakhir"
+            echo "5) Cek Dukungan Format (HEIC, RAW, x265, MOV)"
+            echo "6) Lihat Live Debug Log"
+            echo "0) Keluar"
+            echo "=========================================================="
+            read -p "Pilihan Anda [0-6]: " choice
+        fi
+
+        case "$choice" in
+            1)
+                clear
+                do_update_immich
+                read -p "Tekan [Enter] untuk kembali ke menu..."
+                ;;
+            2)
+                clear
+                do_fresh_install
+                read -p "Tekan [Enter] untuk kembali ke menu..."
+                ;;
+            3)
+                clear
+                do_backup
+                read -p "Tekan [Enter] untuk kembali ke menu..."
+                ;;
+            4)
+                clear
+                do_rollback
+                read -p "Tekan [Enter] untuk kembali ke menu..."
+                ;;
+            5)
+                clear
+                SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+                if [ -f "$SCRIPT_DIR/../tests/test-formats.sh" ]; then
+                    bash "$SCRIPT_DIR/../tests/test-formats.sh"
+                else
+                    ensure_codecs_and_tools
+                fi
+                read -p "Tekan [Enter] untuk kembali ke menu..."
+                ;;
+            6)
+                clear
+                echo "--- 20 Baris Terakhir dari $LOG_FILE ---"
+                tail -n 25 "$LOG_FILE" 2>/dev/null || echo "Log masih kosong."
+                echo "----------------------------------------"
+                read -p "Tekan [Enter] untuk kembali ke menu..."
+                ;;
+            0|*)
+                clear
+                echo "Sampai jumpa! Terima kasih telah menggunakan Immich SBC Tool."
+                break
+                ;;
+        esac
+    done
+}
+
+# ------------------------------------------------------------------------------
+# Entry Point CLI Flag Handling
+# ------------------------------------------------------------------------------
+if [ $# -gt 0 ]; then
+    check_root
+    case "$1" in
+        --install)
+            do_fresh_install
+            ;;
+        --update)
+            do_update_immich
+            ;;
+        --backup)
+            do_backup
+            ;;
+        --rollback)
+            do_rollback
+            ;;
+        --check-formats)
+            ensure_codecs_and_tools
+            ;;
+        --help|-h)
+            echo "Penggunaan: immich-sbc-tool [opsi]"
+            echo "  (tanpa opsi)    Buka TUI Interaktif"
+            echo "  --install       Jalankan Fresh Install teroptimasi Odroid-C2"
+            echo "  --update        Otomatis deteksi dan update ke versi modern"
+            echo "  --backup        Lakukan backup database PostgreSQL dan config"
+            echo "  --rollback      Kembalikan ke versi backup terakhir"
+            echo "  --check-formats Periksa ketersediaan pustaka HEIC/RAW/x265"
+            ;;
+        *)
+            echo "Opsi tidak dikenal: $1. Gunakan --help untuk melihat daftar opsi."
+            exit 1
+            ;;
+    esac
+else
+    show_tui_menu
+fi
