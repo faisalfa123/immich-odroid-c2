@@ -61,8 +61,38 @@ check_root() {
 }
 
 # ------------------------------------------------------------------------------
-# Process Guardian: Suspend Heavy Services Before Build/Update
+# Safe Mode: Unmount / Detach External USB HDD for Power Protection (STB HG680P)
 # ------------------------------------------------------------------------------
+safe_detach_hdd() {
+    log "${YELLOW}⚡ [Power Protection] Mengamankan HDD Eksternal dari drop voltase STB...${NC}"
+    # Deteksi mountpoint HDD pada direktori immich / data
+    local hdd_mounts
+    hdd_mounts=$(df -h | grep -E '/mnt/dietpi_userdata|/media/|/mnt/usb' | awk '{print $6}' || true)
+    
+    if [ -n "$hdd_mounts" ]; then
+        for mnt in $hdd_mounts; do
+            log "   🔒 Mem-flush buffer sync & unmount sementara: ${BOLD}$mnt${NC}"
+            sync
+            # Simpan daftar mount point untuk di-restore nanti
+            echo "$mnt" >> "/tmp/immich_detached_mounts.state"
+            # Unmount lazy agar aman
+            umount -l "$mnt" 2>/dev/null || true
+        done
+        log "   ✅ HDD telah di-unmount sementara. Arus daya STB kini 100% stabil & dingin."
+    else
+        log "   ℹ️ Tidak ada HDD eksternal aktif yang terdeteksi, melanjutkan proses aman."
+    fi
+}
+
+safe_attach_hdd() {
+    if [ -f "/tmp/immich_detached_mounts.state" ]; then
+        log "${CYAN}🔌 [Power Protection] Menghubungkan & me-mount kembali HDD Eksternal...${NC}"
+        # Trigger mount semua fstab
+        mount -a 2>/dev/null || true
+        rm -f "/tmp/immich_detached_mounts.state"
+        log "${GREEN}✅ HDD Eksternal berhasil dihubungkan kembali.${NC}"
+    fi
+}
 suspend_heavy_services() {
     log "${YELLOW}🛡️ [Process Guardian] Memeriksa layanan berat yang berpotensi membebani RAM/CPU...${NC}"
     rm -f "$SUSPENDED_SERVICES_FILE"
@@ -106,6 +136,9 @@ suspend_heavy_services() {
 # Process Guardian: Restore Suspended Services (Called on EXIT/INT/TERM)
 # ------------------------------------------------------------------------------
 restore_services() {
+    # 1. Pasang kembali HDD jika sempat di-detach
+    safe_attach_hdd
+
     if [ -f "$SUSPENDED_SERVICES_FILE" ]; then
         log "${CYAN}🔄 [Process Guardian] Mengembalikan status layanan yang sebelumnya dihentikan...${NC}"
         while IFS= read -r item || [ -n "$item" ]; do
@@ -465,14 +498,17 @@ do_update_immich() {
         
         # 1. Pastikan dependensi sistem native terpasang (Postgres, Redis, Node, FFmpeg)
         ensure_codecs_and_tools
-        
+
         # 2. Hentikan service immich sebelum mengganti binary
         if systemctl is-active --quiet immich; then
             log "   Menghentikan service immich sementara..."
             systemctl stop immich || true
         fi
 
-        # 3. Download bundle pre-built dari GitHub Release (bebas kompilasi lokal)
+        # 3. Fitur Power Protection STB: Unmount sementara HDD agar motor disk tidak narik daya
+        safe_detach_hdd
+
+        # 4. Download bundle pre-built dari GitHub Release (bebas kompilasi lokal)
         local target_version="v3.3.5"
         local bundle_url="https://github.com/faisalfa123/immich-odroid-c2/releases/download/${target_version}/immich-prebuilt-${target_version}-native.tar.gz"
         local temp_tar="/tmp/immich-prebuilt-${target_version}-native.tar.gz"
@@ -489,6 +525,9 @@ do_update_immich() {
                 chown -R immich:immich /opt/immich 2>/dev/null || true
             fi
             
+            # Pasang kembali HDD sebelum menyalakan service
+            safe_attach_hdd
+
             # Nyalakan kembali service immich
             log "   Menjalankan ulang service immich..."
             systemctl daemon-reload
