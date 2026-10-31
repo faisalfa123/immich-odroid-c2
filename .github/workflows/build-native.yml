@@ -48,11 +48,26 @@ jobs:
       - name: Download Immich Source
         run: |
           set -e
-          VERSION="${{ github.event.inputs.immich_version || 'v3.3.5' }}"
+          INPUT_VER="${{ github.event.inputs.immich_version }}"
+          # Default jika kosong
+          if [ -z "$INPUT_VER" ]; then
+            INPUT_VER="v3.3.5"
+          fi
+          
+          # Bersihkan input user jika typo seperti v0.3.3.5 -> v3.3.5 atau 3.3.5 -> v3.3.5
+          # Hapus 'v' dulu
+          CLEAN_VER="${INPUT_VER#v}"
+          # Jika user typo menuliskan 0.3.3.5, ubah jadi 3.3.5
+          if [[ "$CLEAN_VER" == 0.* ]]; then
+            CLEAN_VER="${CLEAN_VER#0.}"
+          fi
+          VERSION="v${CLEAN_VER}"
+          
           echo "BUILD_VERSION=$VERSION" >> $GITHUB_ENV
-          echo "Downloading Immich source for tag: $VERSION"
+          echo "Target Immich Release Version: $VERSION"
+          echo "Downloading Immich source archive: https://github.com/immich-app/immich/archive/${VERSION}.tar.gz"
           curl -sSfL "https://github.com/immich-app/immich/archive/${VERSION}.tar.gz" | tar -xz
-          mv "immich-${VERSION#v}" immich-src
+          mv "immich-${CLEAN_VER}" immich-src
 
       - name: Install Dependencies & Build Web, SDK, Plugins
         run: |
